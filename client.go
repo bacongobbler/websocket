@@ -19,33 +19,19 @@ import (
 	"time"
 )
 
-// ErrBadHandshake is returned when the server response to opening handshake is
-// invalid.
-var ErrBadHandshake = errors.New("websocket: bad handshake")
-
-var errInvalidCompression = errors.New("websocket: invalid compression negotiation")
-
-// NewClient creates a new client connection using the given net connection.
-// The URL u specifies the host and request URI. Use requestHeader to specify
-// the origin (Origin), subprotocols (Sec-WebSocket-Protocol) and cookies
-// (Cookie). Use the response.Header to get the selected subprotocol
-// (Sec-WebSocket-Protocol) and cookies (Set-Cookie).
-//
-// If the WebSocket handshake fails, ErrBadHandshake is returned along with a
-// non-nil *http.Response so that callers can handle redirects, authentication,
-// etc.
-//
-// Deprecated: Use Dialer instead.
-func NewClient(netConn net.Conn, u *url.URL, requestHeader http.Header, readBufSize, writeBufSize int) (c *Conn, response *http.Response, err error) {
-	d := Dialer{
-		ReadBufferSize:  readBufSize,
-		WriteBufferSize: writeBufSize,
-		NetDial: func(net, addr string) (net.Conn, error) {
-			return netConn, nil
-		},
+var (
+	// DefaultDialer is a dialer with all fields set to the default zero values.
+	DefaultDialer = &Dialer{
+		Proxy: http.ProxyFromEnvironment,
 	}
-	return d.Dial(u.String(), requestHeader)
-}
+
+	// ErrBadHandshake is returned when the server response to opening handshake is
+	// invalid.
+	ErrBadHandshake       = errors.New("websocket: bad handshake")
+	errInvalidCompression = errors.New("websocket: invalid compression negotiation")
+	errMalformedRequest   = errors.New("malformed HTTP request")
+	errMalformedURL       = errors.New("malformed ws or wss URL")
+)
 
 // A Dialer contains options for connecting to WebSocket server.
 type Dialer struct {
@@ -78,57 +64,6 @@ type Dialer struct {
 	// guarantee that compression will be supported. Currently only "no context
 	// takeover" modes are supported.
 	EnableCompression bool
-
-	// Jar specifies the cookie jar.
-	// If Jar is nil, cookies are not sent in requests and ignored
-	// in responses.
-	Jar http.CookieJar
-}
-
-var errMalformedURL = errors.New("malformed ws or wss URL")
-
-// parseURL parses the URL.
-//
-// This function is a replacement for the standard library url.Parse function.
-// In Go 1.4 and earlier, url.Parse loses information from the path.
-func parseURL(s string) (*url.URL, error) {
-	// From the RFC:
-	//
-	// ws-URI = "ws:" "//" host [ ":" port ] path [ "?" query ]
-	// wss-URI = "wss:" "//" host [ ":" port ] path [ "?" query ]
-	var u url.URL
-	switch {
-	case strings.HasPrefix(s, "ws://"):
-		u.Scheme = "ws"
-		s = s[len("ws://"):]
-	case strings.HasPrefix(s, "wss://"):
-		u.Scheme = "wss"
-		s = s[len("wss://"):]
-	default:
-		return nil, errMalformedURL
-	}
-
-	if i := strings.Index(s, "?"); i >= 0 {
-		u.RawQuery = s[i+1:]
-		s = s[:i]
-	}
-
-	if i := strings.Index(s, "/"); i >= 0 {
-		u.Opaque = s[i:]
-		s = s[:i]
-	} else {
-		u.Opaque = "/"
-	}
-
-	u.Host = s
-
-	if strings.Contains(u.Host, "@") {
-		// Don't bother parsing user information because user information is
-		// not allowed in websocket URIs.
-		return nil, errMalformedURL
-	}
-
-	return &u, nil
 }
 
 func hostPortNoPort(u *url.URL) (hostPort, hostNoPort string) {
@@ -149,53 +84,10 @@ func hostPortNoPort(u *url.URL) (hostPort, hostNoPort string) {
 	return hostPort, hostNoPort
 }
 
-// DefaultDialer is a dialer with all fields set to the default zero values.
-var DefaultDialer = &Dialer{
-	Proxy: http.ProxyFromEnvironment,
-}
-
-// Dial creates a new client connection. Use requestHeader to specify the
-// origin (Origin), subprotocols (Sec-WebSocket-Protocol) and cookies (Cookie).
-// Use the response.Header to get the selected subprotocol
-// (Sec-WebSocket-Protocol) and cookies (Set-Cookie).
-//
-// If the WebSocket handshake fails, ErrBadHandshake is returned along with a
-// non-nil *http.Response so that callers can handle redirects, authentication,
-// etcetera. The response body may not contain the entire response and does not
-// need to be closed by the application.
-func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Response, error) {
-
-	if d == nil {
-		d = &Dialer{
-			Proxy: http.ProxyFromEnvironment,
-		}
-	}
-
-	challengeKey, err := generateChallengeKey()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	u, err := parseURL(urlStr)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	switch u.Scheme {
-	case "ws":
-		u.Scheme = "http"
-	case "wss":
-		u.Scheme = "https"
-	default:
-		return nil, nil, errMalformedURL
-	}
-
-	if u.User != nil {
-		// User name and password are not allowed in websocket URIs.
-		return nil, nil, errMalformedURL
-	}
-
-	req := &http.Request{
+// DefaultRequest is a request with all fields set to the defaults for a
+// websocket connection with the given URL.
+func DefaultRequest(u *url.URL) *http.Request {
+	return &http.Request{
 		Method:     "GET",
 		URL:        u,
 		Proto:      "HTTP/1.1",
@@ -204,11 +96,61 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 		Header:     make(http.Header),
 		Host:       u.Host,
 	}
+}
 
-	// Set the cookies present in the cookie jar of the dialer
-	if d.Jar != nil {
-		for _, cookie := range d.Jar.Cookies(u) {
-			req.AddCookie(cookie)
+// Dial creates a new client connection using the provided HTTP request.
+//
+// If the WebSocket handshake fails, ErrBadHandshake is returned along with a
+// non-nil *http.Response so that callers can handle redirects, authentication,
+// etcetera. The response body may not contain the entire response and does not
+// need to be closed by the application.
+func (d *Dialer) Dial(req *http.Request) (*Conn, *http.Response, error) {
+
+	if d == nil {
+		d = &Dialer{
+			Proxy: http.ProxyFromEnvironment,
+		}
+	}
+
+	if req == nil {
+		// A request must be set before calling Dial().
+		return nil, nil, errMalformedRequest
+	}
+
+	if req.URL == nil {
+		// A websocket URI must be set before calling Dial().
+		return nil, nil, errMalformedURL
+	}
+
+	challengeKey, err := generateChallengeKey()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch req.URL.Scheme {
+	case "ws":
+		req.URL.Scheme = "http"
+	case "wss":
+		req.URL.Scheme = "https"
+	default:
+		return nil, nil, errMalformedURL
+	}
+
+	if req.URL.User != nil {
+		// User name and password are not allowed in websocket URIs.
+		return nil, nil, errMalformedURL
+	}
+
+	// Do some sanity checking on the request headers
+	for k, _ := range req.Header {
+		switch {
+		case k == "Upgrade" ||
+			k == "Connection" ||
+			k == "Sec-Websocket-Key" ||
+			k == "Sec-Websocket-Version" ||
+			k == "Sec-Websocket-Extensions" ||
+			(k == "Sec-Websocket-Protocol" && len(d.Subprotocols) > 0):
+			return nil, nil, errors.New("websocket: duplicate header not allowed: " + k)
 		}
 	}
 
@@ -223,29 +165,12 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 	if len(d.Subprotocols) > 0 {
 		req.Header["Sec-WebSocket-Protocol"] = []string{strings.Join(d.Subprotocols, ", ")}
 	}
-	for k, vs := range requestHeader {
-		switch {
-		case k == "Host":
-			if len(vs) > 0 {
-				req.Host = vs[0]
-			}
-		case k == "Upgrade" ||
-			k == "Connection" ||
-			k == "Sec-Websocket-Key" ||
-			k == "Sec-Websocket-Version" ||
-			k == "Sec-Websocket-Extensions" ||
-			(k == "Sec-Websocket-Protocol" && len(d.Subprotocols) > 0):
-			return nil, nil, errors.New("websocket: duplicate header not allowed: " + k)
-		default:
-			req.Header[k] = vs
-		}
-	}
 
 	if d.EnableCompression {
 		req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
 	}
 
-	hostPort, hostNoPort := hostPortNoPort(u)
+	hostPort, hostNoPort := hostPortNoPort(req.URL)
 
 	var proxyURL *url.URL
 	// Check wether the proxy method has been configured
@@ -321,7 +246,7 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 		}
 	}
 
-	if u.Scheme == "https" {
+	if req.URL.Scheme == "https" {
 		cfg := cloneTLSConfig(d.TLSClientConfig)
 		if cfg.ServerName == "" {
 			cfg.ServerName = hostNoPort
@@ -347,12 +272,6 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 	resp, err := http.ReadResponse(conn.br, req)
 	if err != nil {
 		return nil, nil, err
-	}
-
-	if d.Jar != nil {
-		if rc := resp.Cookies(); len(rc) > 0 {
-			d.Jar.SetCookies(u, rc)
-		}
 	}
 
 	if resp.StatusCode != 101 ||
